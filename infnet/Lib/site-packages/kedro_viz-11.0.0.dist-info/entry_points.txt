@@ -1,0 +1,8 @@
+[kedro.global_commands]
+kedro-viz = kedro_viz.launchers.cli.main:viz_cli
+
+[kedro.hooks]
+kedro-dataset-stats = kedro_viz.integrations.kedro.hooks:dataset_stats_hook
+
+[kedro.line_magic]
+line_magic = kedro_viz.launchers.jupyter:run_viz

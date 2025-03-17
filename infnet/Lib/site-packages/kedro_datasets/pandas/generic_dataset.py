@@ -1,0 +1,250 @@
+"""``GenericDataset`` loads/saves data from/to a data file using an underlying
+filesystem (e.g.: local, S3, GCS). It uses pandas to handle the
+type of read/write target.
+"""
+from __future__ import annotations
+
+from copy import deepcopy
+from pathlib import PurePosixPath
+from typing import Any
+
+import fsspec
+import pandas as pd
+from kedro.io.core import (
+    AbstractVersionedDataset,
+    DatasetError,
+    Version,
+    get_filepath_str,
+    get_protocol_and_path,
+)
+
+NON_FILE_SYSTEM_TARGETS = [
+    "clipboard",
+    "numpy",
+    "sql",
+    "period",
+    "records",
+    "timestamp",
+    "xarray",
+    "sql_table",
+]
+
+
+class GenericDataset(AbstractVersionedDataset[pd.DataFrame, pd.DataFrame]):
+    """`pandas.GenericDataset` loads/saves data from/to a data file using an underlying
+    filesystem (e.g.: local, S3, GCS). It uses pandas to dynamically select the
+    appropriate type of read/write target on a best effort basis.
+
+    Example usage for the
+    `YAML API <https://docs.kedro.org/en/stable/data/\
+    data_catalog_yaml_examples.html>`_:
+
+    .. code-block:: yaml
+
+        cars:
+          type: pandas.GenericDataset
+          file_format: csv
+          filepath: s3://data/01_raw/company/cars.csv
+          load_args:
+            sep: ","
+            na_values: ["#NA", NA]
+          save_args:
+            index: False
+            date_format: "%Y-%m-%d"
+
+    This second example is able to load a SAS7BDAT file via the ``pd.read_sas`` method.
+    Trying to save this dataset will raise a ``DatasetError`` since pandas does not provide an
+    equivalent ``pd.DataFrame.to_sas`` write method.
+
+    .. code-block:: yaml
+
+        flights:
+           type: pandas.GenericDataset
+           file_format: sas
+           filepath: data/01_raw/airplanes.sas7bdat
+           load_args:
+              format: sas7bdat
+
+    Example usage for the
+    `Python API <https://docs.kedro.org/en/stable/data/\
+    advanced_data_catalog_usage.html>`_:
+
+    .. code-block:: pycon
+
+        >>> from kedro_datasets.pandas import GenericDataset
+        >>> import pandas as pd
+        >>>
+        >>> data = pd.DataFrame({"col1": [1, 2], "col2": [4, 5], "col3": [5, 6]})
+        >>>
+        >>> dataset = GenericDataset(
+        ...     filepath=tmp_path / "test.csv", file_format="csv", save_args={"index": False}
+        ... )
+        >>> dataset.save(data)
+        >>> reloaded = dataset.load()
+        >>> assert data.equals(reloaded)
+
+    """
+
+    DEFAULT_LOAD_ARGS: dict[str, Any] = {}
+    DEFAULT_SAVE_ARGS: dict[str, Any] = {}
+    DEFAULT_FS_ARGS: dict[str, Any] = {"open_args_save": {"mode": "w"}}
+
+    def __init__(  # noqa: PLR0913
+        self,
+        *,
+        filepath: str,
+        file_format: str,
+        load_args: dict[str, Any] | None = None,
+        save_args: dict[str, Any] | None = None,
+        version: Version | None = None,
+        credentials: dict[str, Any] | None = None,
+        fs_args: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ):
+        """Creates a new instance of ``GenericDataset`` pointing to a concrete data file
+        on a specific filesystem. The appropriate pandas load/save methods are
+        dynamically identified by string matching on a best effort basis.
+
+        Args:
+            filepath: Filepath in POSIX format to a file prefixed with a protocol like `s3://`.
+                If prefix is not provided, `file` protocol (local filesystem) will be used.
+                The prefix should be any protocol supported by ``fsspec``.
+                Key assumption: The first argument of either load/save method points to a
+                filepath/buffer/io type location. There are some read/write targets such
+                as 'clipboard' or 'records' that will fail since they do not take a
+                filepath like argument.
+            file_format: String which is used to match the appropriate load/save method on a best
+                effort basis. For example if 'csv' is passed in the `pandas.read_csv` and
+                `pandas.DataFrame.to_csv` will be identified. An error will be raised unless
+                at least one matching `read_{file_format}` or `to_{file_format}` method is
+                identified.
+            load_args: Pandas options for loading files.
+                Here you can find all available arguments:
+                https://pandas.pydata.org/pandas-docs/stable/reference/io.html
+                All defaults are preserved.
+            save_args: Pandas options for saving files.
+                Here you can find all available arguments:
+                https://pandas.pydata.org/pandas-docs/stable/reference/io.html
+                All defaults are preserved, but "index", which is set to False.
+            version: If specified, should be an instance of
+                ``kedro.io.core.Version``. If its ``load`` attribute is
+                None, the latest version will be loaded. If its ``save``
+                attribute is None, save version will be autogenerated.
+            credentials: Credentials required to get access to the underlying filesystem.
+                E.g. for ``GCSFileSystem`` it should look like `{"token": None}`.
+            fs_args: Extra arguments to pass into underlying filesystem class constructor
+                (e.g. `{"project": "my-project"}` for ``GCSFileSystem``), as well as
+                to pass to the filesystem's `open` method through nested keys
+                `open_args_load` and `open_args_save`.
+                Here you can find all available arguments for `open`:
+                https://filesystem-spec.readthedocs.io/en/latest/api.html#fsspec.spec.AbstractFileSystem.open
+                All defaults are preserved, except `mode`, which is set to `w` when saving.
+            metadata: Any arbitrary metadata.
+                This is ignored by Kedro, but may be consumed by users or external plugins.
+
+        Raises:
+            DatasetError: Will be raised if at least less than one appropriate
+                read or write methods are identified.
+        """
+
+        self._file_format = file_format.lower()
+
+        _fs_args = deepcopy(fs_args) or {}
+        _fs_open_args_load = _fs_args.pop("open_args_load", {})
+        _fs_open_args_save = _fs_args.pop("open_args_save", {})
+        _credentials = deepcopy(credentials) or {}
+
+        protocol, path = get_protocol_and_path(filepath)
+        if protocol == "file":
+            _fs_args.setdefault("auto_mkdir", True)
+
+        self._protocol = protocol
+        self._fs = fsspec.filesystem(self._protocol, **_credentials, **_fs_args)
+
+        self.metadata = metadata
+
+        super().__init__(
+            filepath=PurePosixPath(path),
+            version=version,
+            exists_function=self._fs.exists,
+            glob_function=self._fs.glob,
+        )
+
+        # Handle default load and save and fs arguments
+        self._load_args = {**self.DEFAULT_LOAD_ARGS, **(load_args or {})}
+        self._save_args = {**self.DEFAULT_SAVE_ARGS, **(save_args or {})}
+        self._fs_open_args_load = {
+            **self.DEFAULT_FS_ARGS.get("open_args_load", {}),
+            **(_fs_open_args_load or {}),
+        }
+        self._fs_open_args_save = {
+            **self.DEFAULT_FS_ARGS.get("open_args_save", {}),
+            **(_fs_open_args_save or {}),
+        }
+
+    def _ensure_file_system_target(self) -> None:
+        # Fail fast if provided a known non-filesystem target
+        if self._file_format in NON_FILE_SYSTEM_TARGETS:
+            raise DatasetError(
+                f"Cannot create a dataset of file_format '{self._file_format}' as it "
+                f"does not support a filepath target/source."
+            )
+
+    def load(self) -> pd.DataFrame:
+        self._ensure_file_system_target()
+
+        load_path = get_filepath_str(self._get_load_path(), self._protocol)
+        load_method = getattr(pd, f"read_{self._file_format}", None)
+        if load_method:
+            with self._fs.open(load_path, **self._fs_open_args_load) as fs_file:
+                return load_method(fs_file, **self._load_args)
+        raise DatasetError(
+            f"Unable to retrieve 'pandas.read_{self._file_format}' method, please ensure that your "
+            "'file_format' parameter has been defined correctly as per the Pandas API "
+            "https://pandas.pydata.org/docs/reference/io.html"
+        )
+
+    def save(self, data: pd.DataFrame) -> None:
+        self._ensure_file_system_target()
+
+        save_path = get_filepath_str(self._get_save_path(), self._protocol)
+        save_method = getattr(data, f"to_{self._file_format}", None)
+        if save_method:
+            with self._fs.open(save_path, **self._fs_open_args_save) as fs_file:
+                # KEY ASSUMPTION - first argument is path/buffer/io
+                save_method(fs_file, **self._save_args)
+                self._invalidate_cache()
+        else:
+            raise DatasetError(
+                f"Unable to retrieve 'pandas.DataFrame.to_{self._file_format}' method, please "
+                "ensure that your 'file_format' parameter has been defined correctly as "
+                "per the Pandas API "
+                "https://pandas.pydata.org/docs/reference/api/pandas.DataFrame.html"
+            )
+
+    def _exists(self) -> bool:
+        try:
+            load_path = get_filepath_str(self._get_load_path(), self._protocol)
+        except DatasetError:
+            return False
+
+        return self._fs.exists(load_path)
+
+    def _describe(self) -> dict[str, Any]:
+        return {
+            "file_format": self._file_format,
+            "filepath": self._filepath,
+            "protocol": self._protocol,
+            "load_args": self._load_args,
+            "save_args": self._save_args,
+            "version": self._version,
+        }
+
+    def _release(self) -> None:
+        super()._release()
+        self._invalidate_cache()
+
+    def _invalidate_cache(self) -> None:
+        """Invalidate underlying filesystem caches."""
+        filepath = get_filepath_str(self._filepath, self._protocol)
+        self._fs.invalidate_cache(filepath)

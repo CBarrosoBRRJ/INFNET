@@ -1,0 +1,10 @@
+ipython>=8.10
+jupyterlab>=3.0
+kedro~=0.19.11
+notebook
+kedro-datasets>=3.0
+kedro-viz>=6.7.0
+kedro[jupyter]~=0.19.11
+scikit-learn~=1.5.1
+pyarrow
+openpyxl
